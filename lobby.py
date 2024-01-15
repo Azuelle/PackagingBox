@@ -3,35 +3,46 @@ import json
 from enum import IntEnum
 from contextlib import closing
 
-# CONSTS
 
-
-class STATUS(IntEnum):
-    OPEN = 0
-    INGAME = 1
-
+MAX_PLAYERS = 6
 
 # LIST
 
 
 def init() -> None:
-    with closing(lite.connect("lobby.db")) as lobby:
-        lobby.execute(
+    with closing(lite.connect("lobbies.db")) as lobby:
+        lobby.executescript(
             """
-CREATE TABLE IF NOT EXISTS lobby (
+CREATE TABLE IF NOT EXISTS "lobby" (
     "id"            INTEGER UNIQUE,
-    "owner"         INTEGER NOT NULL,
-    "players"       TEXT NOT NULL,
-    "status"        INTEGER,
+    "owner_id"         INTEGER NOT NULL,
+    "player_count"  INTEGER NOT NULL,
+    "game_state"    TEXT,
     PRIMARY KEY("id" AUTOINCREMENT)
-)
+);
+CREATE TABLE IF NOT EXISTS "player" (
+	"lobby_id"	INTEGER NOT NULL,
+	"player_id"	INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS "session" (
+	"player_id"	INTEGER UNIQUE NOT NULL,
+	"session"	INTEGER NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS "lobby_id" ON "lobby" (
+	"id"	DESC
+);
+CREATE INDEX IF NOT EXISTS "lobby_player" ON "player" (
+	"lobby_id"	DESC,
+	"player_id"
+);
 """
-            # TODO utilize index & use a new table for storing [players]
         )
+        lobby.commit()
 
 
 def get_lobby_list() -> list:
-    with closing(lite.connect("lobby.db")) as lobby:
+    with closing(lite.connect("lobbies.db")) as lobby:
         lobby_list = lobby.execute("SELECT * FROM lobby").fetchall()
     return lobby_list
 
@@ -40,70 +51,167 @@ def get_lobby_list() -> list:
 
 
 def create_lobby(owner_id: int) -> int:
-    with closing(lite.connect("lobby.db")) as lobby:
-        lobby.execute(
-            "INSERT INTO lobby (owner, players, status) VALUES (?, ?, ?)",
+    with closing(lite.connect("lobbies.db")) as lobby:
+        id = lobby.execute(
+            'INSERT INTO "lobby" (owner_id, player_count) VALUES (?, ?)',
             (
                 owner_id,
-                json.dumps([owner_id]),
-                STATUS.OPEN,
+                1,
+            ),
+        ).lastrowid  # Yes this should be the Auto Incremented ID (somehow)
+        lobby.execute(
+            'INSERT INTO "player" (lobby_id, player_id) VALUES (?, ?)',
+            (
+                id,
+                owner_id,
             ),
         )
         lobby.commit()
-        id = lobby.execute("SELECT MAX(id) FROM lobby").fetchone()[0]
     return id
 
 
 def remove_lobby(id: int) -> None:
-    with closing(lite.connect("lobby.db")) as lobby:
+    with closing(lite.connect("lobbies.db")) as lobby:
         lobby.execute("DELETE FROM lobby WHERE id = ?", (id,))
+        lobby.execute("DELETE FROM player WHERE lobby_id = ?", (id,))
         lobby.commit()
 
 
 # STATUS
 
 
-def get_lobby_status(id: int) -> STATUS:
-    with closing(lite.connect("lobby.db")) as lobby:
-        status = lobby.execute(
-            "SELECT status FROM lobby WHERE id = ?", (id,)
-        ).fetchone()[0]
+def check_ingame(id: int) -> bool:
+    return get_game_state(id) is None
+
+
+def get_lobby_status(id: int) -> str:
+    status = f"#{id} — "
+    with closing(lite.connect("lobbies.db")) as lobby:
+        l = lobby.execute("SELECT * FROM lobby WHERE id = ?", (id,)).fetchone()
+        if l != None:
+            status += f"Owner {l[1]} — "
+
+            players = lobby.execute(
+                "SELECT player_id FROM player WHERE lobby_id = ?", (id,)
+            ).fetchall()
+            status += f"{l[2]} / {MAX_PLAYERS} player{'s' if l[2]>1 else ''} [{", ".join([str(i[0]) for i in players])}] — "
+
+            status += "Waiting" if check_ingame(id) else "In Game"
+        else:
+            status = "ERROR — Lobby not found"
     return status
 
 
-def set_lobby_status(id: int, status: STATUS) -> None:
-    with closing(lite.connect("lobby.db")) as lobby:
-        lobby.execute("UPDATE lobby SET status = ? WHERE id = ?", (status, id))
+def get_game_state(lobby_id: int) -> dict:
+    with closing(lite.connect("lobbies.db")) as lobby:
+        state = lobby.execute(
+            "SELECT game_state FROM lobby WHERE id = ?", (id,)
+        ).fetchone()[0]
+    return state
+
+
+def set_game_state(lobby_id: int, state: dict) -> None:
+    with closing(lite.connect("lobbies.db")) as lobby:
+        lobby.execute(
+            "UPDATE lobby SET game_state = ? WHERE id = ?",
+            (json.dumps(state), lobby_id),
+        )
         lobby.commit()
 
 
 # PLAYER
 
 
+def change_owner(lobby_id: int, owner_id: int) -> None:
+    with closing(lite.connect("lobbies.db")) as lobby:
+        lobby.execute(
+            "UPDATE lobby SET owner_id = ? WHERE id = ?", (owner_id, lobby_id)
+        )
+        lobby.commit()
+
+
 def add_player(lobby_id: int, player_id: int) -> None:
-    with closing(lite.connect("lobby.db")) as lobby:
-        l = lobby.execute("SELECT * FROM lobby WHERE id = ?", (id,)).fetchone()[0]
-        if l is not None:
-            print(l)
+    with closing(lite.connect("lobbies.db")) as lobby:
+        # Update lobby table
+        count = lobby.execute(
+            "SELECT player_count FROM lobby WHERE id = ?", (id,)
+        ).fetchone()[0]
+        lobby.execute("UPDATE lobby SET player_count = ? WHERE id = ?", (count + 1, id))
+
+        # Update player table
+        lobby.execute(
+            "INSERT INTO player (lobby_id, player_id) VALUES (?, ?)",
+            (lobby_id, player_id),
+        )
+
+        lobby.commit()
 
 
 def remove_player(lobby_id: int, player_id: int) -> None:
-    with closing(lite.connect("lobby.db")) as lobby:
-        l = lobby.execute("SELECT * FROM lobby WHERE id = ?", (id,)).fetchone()[0]
-        players = l
+    with closing(lite.connect("lobbies.db")) as lobby:
+        l = lobby.execute("SELECT * FROM lobby WHERE id = ?", (lobby_id,)).fetchone()
+
+        # Check if owner
+        if l[1] == player_id:
+            print("is owner")
+            if l[2] == 1:
+                # Sole player in lobby, simply delete lobby
+                remove_lobby(lobby_id)
+                return
+            else:
+                # Fetch one player from lobby
+                next_owner = lobby.execute(
+                    "SELECT player_id FROM player WHERE lobby_id = ? AND player_id != ?",
+                    (lobby_id, player_id),
+                ).fetchone()[0]
+                # Exchange owner of the lobby and proceed as normal
+                change_owner(lobby_id, next_owner)
+
+        # Update lobby table
+        lobby.execute(
+            "UPDATE lobby SET player_count = ? WHERE id = ?",
+            (l[2] - 1, lobby_id),
+        )
+
+        # Update player table
+        lobby.execute(
+            "DELETE FROM player WHERE lobby_id = ? AND player_id = ?",
+            (lobby_id, player_id),
+        )
+
+        lobby.commit()
 
 
 # FOR TESTING
 
 if __name__ == "__main__":
+    print("=== TESTING LOBBY.PY ===")
+
+    print("\n>>> Init & print lobby list")
     init()
     print(get_lobby_list())
-    print(id := create_lobby(23333))
+
+    print("\n>>> Create new lobby owned by 23333")
+    print("ID:", id := create_lobby(23333))
     print(get_lobby_list())
     print(get_lobby_status(id))
-    set_lobby_status(id, STATUS.INGAME)
-    print(get_lobby_status(id))
+
+    print("\n>>> Update lobby gamestate")
+    set_game_state(id, {})
+    print(get_game_state(id))
     print(get_lobby_list())
+    print(get_lobby_status(id))
+
+    print("\n>>> Add player 2048")
     add_player(id, 2048)
-    remove_player(id, 2048)
+    print(get_lobby_list())
+    print(get_lobby_status(id))
+
+    print("\n>>> Remove player 23333")
+    remove_player(id, 23333)
+    print(get_lobby_list())
+    print(get_lobby_status(id))
+
+    print("\n>>> Remove lobby")
     remove_lobby(id)
+    print(get_lobby_list())
